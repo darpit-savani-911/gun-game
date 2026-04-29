@@ -1,0 +1,673 @@
+// =====================================================================
+//  TOP-DOWN SHOOTER — C++ + SFML 2.5
+//  Compile: g++ gun_game.cpp -o gun_game -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-system
+//  Install SFML: sudo apt install libsfml-dev   (Linux)
+//               brew install sfml               (macOS)
+//               Download from sfml-dev.org      (Windows)
+// =====================================================================
+
+#include <SFML/Graphics.hpp>
+#include <SFML/Audio.hpp>
+#include <cmath>
+#include <vector>
+#include <deque>
+#include <string>
+#include <sstream>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>
+#include <memory>
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const int   W          = 1280;
+const int   H          = 720;
+const float PI         = 3.14159265f;
+const float PLAYER_SPD = 220.f;
+const float BULLET_SPD = 650.f;
+const float ENEMY_SPD  = 90.f;
+const float FIRE_RATE  = 0.12f;  // seconds between shots
+const int   TILE       = 64;     // grid tile size
+
+// ─── Utility ──────────────────────────────────────────────────────────────────
+sf::Vector2f normalize(sf::Vector2f v) {
+    float len = std::sqrt(v.x * v.x + v.y * v.y);
+    return len > 0 ? v / len : v;
+}
+
+float dist(sf::Vector2f a, sf::Vector2f b) {
+    sf::Vector2f d = b - a;
+    return std::sqrt(d.x * d.x + d.y * d.y);
+}
+
+// ─── Particle ─────────────────────────────────────────────────────────────────
+struct Particle {
+    sf::CircleShape shape;
+    sf::Vector2f    vel;
+    float           life, maxLife;
+    sf::Color       color;
+
+    Particle(sf::Vector2f pos, sf::Vector2f v, float l, sf::Color c)
+        : vel(v), life(l), maxLife(l), color(c)
+    {
+        float r = 2.f + (rand() % 3);
+        shape.setRadius(r);
+        shape.setOrigin(r, r);
+        shape.setPosition(pos);
+        shape.setFillColor(c);
+    }
+
+    bool update(float dt) {
+        life -= dt;
+        shape.move(vel * dt);
+        vel *= 0.92f;
+        float alpha = std::max(0.f, life / maxLife);
+        shape.setFillColor(sf::Color(color.r, color.g, color.b, (sf::Uint8)(alpha * 255)));
+        return life > 0;
+    }
+};
+
+// ─── Bullet ───────────────────────────────────────────────────────────────────
+struct Bullet {
+    sf::RectangleShape shape;
+    sf::Vector2f       vel;
+    bool               alive = true;
+    bool               fromPlayer;
+
+    Bullet(sf::Vector2f pos, sf::Vector2f dir, bool fp)
+        : fromPlayer(fp)
+    {
+        shape.setSize({18.f, 5.f});
+        shape.setOrigin(9.f, 2.5f);
+        shape.setPosition(pos);
+        float angle = std::atan2(dir.y, dir.x) * 180.f / PI;
+        shape.setRotation(angle);
+        shape.setFillColor(fp ? sf::Color(255, 230, 80) : sf::Color(255, 80, 80));
+        vel = dir * BULLET_SPD;
+    }
+
+    void update(float dt) {
+        shape.move(vel * dt);
+        auto p = shape.getPosition();
+        if (p.x < 0 || p.x > W || p.y < 0 || p.y > H) alive = false;
+    }
+};
+
+// ─── Enemy ────────────────────────────────────────────────────────────────────
+struct Enemy {
+    sf::ConvexShape body;
+    sf::CircleShape eyeL, eyeR;
+    sf::Vector2f    pos;
+    float           hp, maxHp;
+    float           speed;
+    float           shootTimer = 0;
+    float           shootRate;
+    bool            alive = true;
+    sf::Color       baseColor;
+
+    Enemy(sf::Vector2f p, int wave)
+        : pos(p), hp(60 + wave * 15), maxHp(60 + wave * 15),
+          speed(ENEMY_SPD + wave * 5.f), shootRate(2.5f - wave * 0.1f)
+    {
+        if (shootRate < 0.8f) shootRate = 0.8f;
+
+        // Hexagonal body
+        body.setPointCount(6);
+        float r = 22.f;
+        for (int i = 0; i < 6; i++) {
+            float a = i * 60.f * PI / 180.f;
+            body.setPoint(i, {r * std::cos(a), r * std::sin(a)});
+        }
+        body.setOrigin(0, 0);
+
+        // Color per wave
+        int hue = (wave * 40) % 360;
+        baseColor = sf::Color(
+            (sf::Uint8)(128 + 127 * std::sin(hue * PI / 180.f)),
+            (sf::Uint8)(128 + 127 * std::sin((hue + 120) * PI / 180.f)),
+            (sf::Uint8)(128 + 127 * std::sin((hue + 240) * PI / 180.f))
+        );
+        body.setFillColor(baseColor);
+        body.setOutlineColor(sf::Color::White);
+        body.setOutlineThickness(2.f);
+
+        // Eyes
+        eyeL.setRadius(4.f); eyeL.setFillColor(sf::Color::White);
+        eyeR.setRadius(4.f); eyeR.setFillColor(sf::Color::White);
+        eyeL.setOrigin(4.f, 4.f);
+        eyeR.setOrigin(4.f, 4.f);
+
+        body.setPosition(pos);
+    }
+
+    // Returns a bullet if it fires, nullptr otherwise
+    std::unique_ptr<Bullet> update(float dt, sf::Vector2f playerPos,
+                                   std::vector<Particle>& particles)
+    {
+        // Move toward player
+        sf::Vector2f dir = normalize(playerPos - pos);
+        pos += dir * speed * dt;
+
+        // Clamp to screen
+        pos.x = std::max(30.f, std::min((float)W - 30.f, pos.x));
+        pos.y = std::max(30.f, std::min((float)H - 30.f, pos.y));
+
+        body.setPosition(pos);
+
+        float angle = std::atan2(dir.y, dir.x) * 180.f / PI;
+        body.setRotation(angle);
+
+        eyeL.setPosition(pos + sf::Vector2f(dir.y * -8.f, dir.x * 8.f) + dir * 12.f);
+        eyeR.setPosition(pos + sf::Vector2f(dir.y * 8.f, dir.x * -8.f) + dir * 12.f);
+
+        // Shoot
+        shootTimer += dt;
+        if (shootTimer >= shootRate) {
+            shootTimer = 0;
+            return std::make_unique<Bullet>(pos, dir, false);
+        }
+        return nullptr;
+    }
+
+    void draw(sf::RenderWindow& win) const {
+        win.draw(body);
+        win.draw(eyeL);
+        win.draw(eyeR);
+    }
+
+    void spawnDeathParticles(std::vector<Particle>& p) const {
+        for (int i = 0; i < 20; i++) {
+            float a = (rand() % 360) * PI / 180.f;
+            float spd = 80.f + rand() % 200;
+            p.push_back(Particle(pos,
+                {std::cos(a) * spd, std::sin(a) * spd},
+                0.6f + (rand() % 40) / 100.f,
+                baseColor));
+        }
+    }
+};
+
+// ─── Player ───────────────────────────────────────────────────────────────────
+struct Player {
+    sf::ConvexShape body;
+    sf::ConvexShape gun;
+    sf::CircleShape shield;
+    sf::Vector2f    pos;
+    float           hp = 100.f, maxHp = 100.f;
+    float           fireTimer = 0;
+    int             ammo = 30, maxAmmo = 30;
+    float           reloadTimer = 0;
+    bool            reloading = false;
+    int             score = 0;
+    float           invincibleTimer = 0;
+
+    Player() : pos((float)W / 2, (float)H / 2) {
+        // Pentagon body
+        body.setPointCount(5);
+        float r = 20.f;
+        for (int i = 0; i < 5; i++) {
+            float a = (i * 72.f - 90.f) * PI / 180.f;
+            body.setPoint(i, {r * std::cos(a), r * std::sin(a)});
+        }
+        body.setFillColor(sf::Color(50, 180, 255));
+        body.setOutlineColor(sf::Color(180, 240, 255));
+        body.setOutlineThickness(2.f);
+
+        // Gun barrel
+        gun.setPointCount(4);
+        gun.setPoint(0, {0, -4});
+        gun.setPoint(1, {28, -3});
+        gun.setPoint(2, {28, 3});
+        gun.setPoint(3, {0, 4});
+        gun.setFillColor(sf::Color(200, 200, 200));
+
+        // Shield circle
+        shield.setRadius(26.f);
+        shield.setOrigin(26.f, 26.f);
+        shield.setFillColor(sf::Color(100, 200, 255, 30));
+        shield.setOutlineColor(sf::Color(100, 200, 255, 120));
+        shield.setOutlineThickness(2.f);
+    }
+
+    void update(float dt) {
+        // Clamp
+        pos.x = std::max(30.f, std::min((float)W - 30.f, pos.x));
+        pos.y = std::max(30.f, std::min((float)H - 30.f, pos.y));
+
+        body.setPosition(pos);
+        shield.setPosition(pos);
+
+        if (fireTimer > 0) fireTimer -= dt;
+        if (invincibleTimer > 0) invincibleTimer -= dt;
+
+        if (reloading) {
+            reloadTimer += dt;
+            if (reloadTimer >= 2.f) {
+                ammo = maxAmmo;
+                reloading = false;
+                reloadTimer = 0;
+            }
+        }
+    }
+
+    void aimAt(sf::Vector2f target) {
+        sf::Vector2f dir = target - pos;
+        float angle = std::atan2(dir.y, dir.x) * 180.f / PI;
+        body.setRotation(angle);
+        gun.setPosition(pos);
+        gun.setRotation(angle);
+    }
+
+    std::unique_ptr<Bullet> shoot(sf::Vector2f target, std::vector<Particle>& particles) {
+        if (fireTimer > 0 || reloading || ammo <= 0) return nullptr;
+        fireTimer = FIRE_RATE;
+        ammo--;
+
+        sf::Vector2f dir = normalize(target - pos);
+
+        // Muzzle flash particles
+        sf::Vector2f muzzle = pos + dir * 30.f;
+        for (int i = 0; i < 5; i++) {
+            float spread = ((rand() % 60) - 30) * PI / 180.f;
+            float a = std::atan2(dir.y, dir.x) + spread;
+            float spd = 100.f + rand() % 150;
+            particles.push_back(Particle(muzzle,
+                {std::cos(a) * spd, std::sin(a) * spd},
+                0.15f, sf::Color(255, 220, 80)));
+        }
+
+        if (ammo == 0) { reloading = true; reloadTimer = 0; }
+        return std::make_unique<Bullet>(pos + dir * 28.f, dir, true);
+    }
+
+    void takeDamage(float dmg, std::vector<Particle>& particles) {
+        if (invincibleTimer > 0) return;
+        hp -= dmg;
+        invincibleTimer = 0.5f;
+        for (int i = 0; i < 8; i++) {
+            float a = (rand() % 360) * PI / 180.f;
+            float spd = 60.f + rand() % 120;
+            particles.push_back(Particle(pos,
+                {std::cos(a) * spd, std::sin(a) * spd},
+                0.4f, sf::Color(255, 80, 80)));
+        }
+    }
+
+    void draw(sf::RenderWindow& win) const {
+        if ((int)(invincibleTimer * 10) % 2 == 0) {
+            win.draw(shield);
+            win.draw(gun);
+            win.draw(body);
+        }
+    }
+};
+
+// ─── Background Grid ──────────────────────────────────────────────────────────
+void drawBackground(sf::RenderWindow& win) {
+    static sf::RectangleShape tile;
+    tile.setSize({(float)TILE, (float)TILE});
+    tile.setFillColor(sf::Color(15, 18, 28));
+    tile.setOutlineColor(sf::Color(30, 35, 50));
+    tile.setOutlineThickness(1.f);
+    for (int x = 0; x < W; x += TILE)
+        for (int y = 0; y < H; y += TILE) {
+            tile.setPosition((float)x, (float)y);
+            win.draw(tile);
+        }
+}
+
+// ─── HUD ──────────────────────────────────────────────────────────────────────
+void drawHUD(sf::RenderWindow& win, const Player& player,
+             int wave, sf::Font& font)
+{
+    // HP bar
+    sf::RectangleShape hpBg({200.f, 18.f});
+    hpBg.setPosition(20.f, H - 40.f);
+    hpBg.setFillColor(sf::Color(60, 0, 0));
+    win.draw(hpBg);
+
+    sf::RectangleShape hpBar({200.f * (player.hp / player.maxHp), 18.f});
+    hpBar.setPosition(20.f, H - 40.f);
+    hpBar.setFillColor(sf::Color(80, 220, 80));
+    win.draw(hpBar);
+
+    // Ammo dots
+    for (int i = 0; i < player.maxAmmo; i++) {
+        sf::CircleShape dot(5.f);
+        dot.setPosition(20.f + i * 13.f, H - 60.f);
+        dot.setFillColor(i < player.ammo
+            ? sf::Color(255, 220, 50)
+            : sf::Color(60, 60, 60));
+        win.draw(dot);
+    }
+
+    // Score
+    sf::Text txt;
+    txt.setFont(font);
+    txt.setCharacterSize(22);
+    txt.setFillColor(sf::Color::White);
+    txt.setString("SCORE  " + std::to_string(player.score));
+    txt.setPosition(W - 220.f, 20.f);
+    win.draw(txt);
+
+    // Wave
+    txt.setString("WAVE  " + std::to_string(wave));
+    txt.setPosition(W / 2.f - 60.f, 20.f);
+    win.draw(txt);
+
+    // Reloading
+    if (player.reloading) {
+        txt.setString("RELOADING...");
+        txt.setFillColor(sf::Color(255, 200, 50));
+        txt.setPosition(20.f, H - 80.f);
+        win.draw(txt);
+    }
+}
+
+// ─── Crosshair ────────────────────────────────────────────────────────────────
+void drawCrosshair(sf::RenderWindow& win, sf::Vector2f pos) {
+    sf::Color c(255, 50, 50, 200);
+    float gap = 8.f, len = 14.f, thick = 2.f;
+
+    auto line = [&](sf::Vector2f a, sf::Vector2f b) {
+        sf::RectangleShape r;
+        sf::Vector2f d = b - a;
+        r.setSize({std::sqrt(d.x*d.x + d.y*d.y), thick});
+        r.setOrigin(0.f, thick / 2.f);
+        r.setPosition(a);
+        r.setRotation(std::atan2(d.y, d.x) * 180.f / PI);
+        r.setFillColor(c);
+        win.draw(r);
+    };
+
+    line(pos + sf::Vector2f(-gap - len, 0), pos + sf::Vector2f(-gap, 0));
+    line(pos + sf::Vector2f(gap, 0),        pos + sf::Vector2f(gap + len, 0));
+    line(pos + sf::Vector2f(0, -gap - len), pos + sf::Vector2f(0, -gap));
+    line(pos + sf::Vector2f(0, gap),        pos + sf::Vector2f(0, gap + len));
+}
+
+// ─── Screen Flash ─────────────────────────────────────────────────────────────
+struct Flash {
+    sf::RectangleShape rect;
+    float life = 0;
+    Flash() { rect.setSize({(float)W, (float)H}); }
+    void trigger(sf::Color c) { rect.setFillColor(c); life = 0.15f; }
+    void update(float dt) { if (life > 0) life -= dt; }
+    void draw(sf::RenderWindow& win) {
+        if (life > 0) {
+            float a = life / 0.15f * 100.f;
+            auto c = rect.getFillColor();
+            c.a = (sf::Uint8)a;
+            rect.setFillColor(c);
+            win.draw(rect);
+        }
+    }
+};
+
+// ─── Game State ───────────────────────────────────────────────────────────────
+enum class State { Menu, Playing, GameOver };
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+int main() {
+    srand((unsigned)time(nullptr));
+
+    sf::RenderWindow win(sf::VideoMode(W, H), "TOP-DOWN SHOOTER",
+                         sf::Style::Titlebar | sf::Style::Close);
+    win.setFramerateLimit(120);
+    win.setMouseCursorVisible(false);
+
+    // Font — falls back gracefully if not found
+    sf::Font font;
+    bool fontLoaded = font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf");
+    if (!fontLoaded) font.loadFromFile("C:/Windows/Fonts/consola.ttf");  // Windows
+
+    State state = State::Menu;
+    int   wave  = 1;
+
+    Player              player;
+    std::vector<Enemy>  enemies;
+    std::vector<Bullet> bullets;
+    std::vector<Particle> particles;
+    Flash               flash;
+
+    float   waveSpawnTimer   = 0;
+    int     enemiesLeft      = 0;
+    int     enemiesToSpawn   = 0;
+    float   spawnInterval    = 1.2f;
+    float   timeSinceSpawn   = 0;
+
+    auto startWave = [&](int w) {
+        wave           = w;
+        enemiesToSpawn = 4 + w * 2;
+        enemiesLeft    = enemiesToSpawn;
+        timeSinceSpawn = 0;
+        bullets.clear();
+    };
+
+    auto resetGame = [&]() {
+        player    = Player();
+        enemies.clear();
+        bullets.clear();
+        particles.clear();
+        startWave(1);
+        state = State::Playing;
+    };
+
+    sf::Clock clock;
+
+    // ── Menu / Game Over text ──────────────────────────────────────────────────
+    auto centeredText = [&](const std::string& s, float y, unsigned sz,
+                             sf::Color col = sf::Color::White) {
+        sf::Text t;
+        t.setFont(font);
+        t.setString(s);
+        t.setCharacterSize(sz);
+        t.setFillColor(col);
+        sf::FloatRect r = t.getLocalBounds();
+        t.setOrigin(r.left + r.width / 2, r.top + r.height / 2);
+        t.setPosition((float)W / 2, y);
+        return t;
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    while (win.isOpen()) {
+        float dt = clock.restart().asSeconds();
+        if (dt > 0.05f) dt = 0.05f;
+
+        sf::Event ev;
+        while (win.pollEvent(ev)) {
+            if (ev.type == sf::Event::Closed) win.close();
+
+            if (ev.type == sf::Event::KeyPressed) {
+                if (ev.key.code == sf::Keyboard::Escape) win.close();
+
+                if (state == State::Menu && ev.key.code == sf::Keyboard::Enter)
+                    resetGame();
+
+                if (state == State::GameOver && ev.key.code == sf::Keyboard::Enter)
+                    resetGame();
+
+                if (state == State::Playing && ev.key.code == sf::Keyboard::R
+                    && !player.reloading && player.ammo < player.maxAmmo) {
+                    player.reloading  = true;
+                    player.reloadTimer = 0;
+                }
+            }
+        }
+
+        sf::Vector2f mousePos = win.mapPixelToCoords(sf::Mouse::getPosition(win));
+
+        // ── Update ────────────────────────────────────────────────────────────
+        if (state == State::Playing) {
+            // Player movement (WASD / Arrow)
+            sf::Vector2f mv;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::W) ||
+                sf::Keyboard::isKeyPressed(sf::Keyboard::Up))    mv.y -= 1;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::S) ||
+                sf::Keyboard::isKeyPressed(sf::Keyboard::Down))  mv.y += 1;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::A) ||
+                sf::Keyboard::isKeyPressed(sf::Keyboard::Left))  mv.x -= 1;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::D) ||
+                sf::Keyboard::isKeyPressed(sf::Keyboard::Right)) mv.x += 1;
+            mv = normalize(mv);
+            player.pos += mv * PLAYER_SPD * dt;
+            player.update(dt);
+            player.aimAt(mousePos);
+
+            // Shoot
+            if (sf::Mouse::isButtonPressed(sf::Mouse::Left)) {
+                auto b = player.shoot(mousePos, particles);
+                if (b) bullets.push_back(*b);
+            }
+
+            // Spawn enemies
+            if ((int)enemies.size() < enemiesToSpawn) {
+                timeSinceSpawn += dt;
+                if (timeSinceSpawn >= spawnInterval) {
+                    timeSinceSpawn = 0;
+                    // Spawn on edge
+                    sf::Vector2f sp;
+                    int side = rand() % 4;
+                    switch (side) {
+                        case 0: sp = {(float)(rand()%W), 10.f}; break;
+                        case 1: sp = {(float)(rand()%W), (float)(H-10)}; break;
+                        case 2: sp = {10.f, (float)(rand()%H)}; break;
+                        default:sp = {(float)(W-10), (float)(rand()%H)}; break;
+                    }
+                    enemies.push_back(Enemy(sp, wave));
+                }
+            }
+
+            // Update enemies
+            for (auto& e : enemies) {
+                auto b = e.update(dt, player.pos, particles);
+                if (b) bullets.push_back(*b);
+            }
+
+            // Update bullets
+            for (auto& b : bullets) b.update(dt);
+
+            // Bullet–enemy collisions
+            for (auto& b : bullets) {
+                if (!b.alive || !b.fromPlayer) continue;
+                for (auto& e : enemies) {
+                    if (!e.alive) continue;
+                    if (dist(b.shape.getPosition(), e.pos) < 26.f) {
+                        e.hp -= 25.f;
+                        b.alive = false;
+                        // Hit spark
+                        for (int i = 0; i < 6; i++) {
+                            float a = (rand()%360)*PI/180.f;
+                            particles.push_back(Particle(
+                                b.shape.getPosition(),
+                                {std::cos(a)*150.f, std::sin(a)*150.f},
+                                0.2f, sf::Color(255,230,80)));
+                        }
+                        if (e.hp <= 0) {
+                            e.alive = false;
+                            e.spawnDeathParticles(particles);
+                            player.score += 100 * wave;
+                            flash.trigger(sf::Color(255, 100, 0, 80));
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Bullet–player collisions
+            for (auto& b : bullets) {
+                if (!b.alive || b.fromPlayer) continue;
+                if (dist(b.shape.getPosition(), player.pos) < 24.f) {
+                    b.alive = false;
+                    player.takeDamage(15.f, particles);
+                    flash.trigger(sf::Color(255, 0, 0, 80));
+                }
+            }
+
+            // Enemy–player collisions
+            for (auto& e : enemies) {
+                if (!e.alive) continue;
+                if (dist(e.pos, player.pos) < 40.f) {
+                    player.takeDamage(0.5f, particles);
+                }
+            }
+
+            // Player death
+            if (player.hp <= 0) {
+                for (int i = 0; i < 40; i++) {
+                    float a = (rand()%360)*PI/180.f;
+                    float spd = 80.f + rand()%300;
+                    particles.push_back(Particle(player.pos,
+                        {std::cos(a)*spd, std::sin(a)*spd},
+                        1.f, sf::Color(50,180,255)));
+                }
+                state = State::GameOver;
+            }
+
+            // Remove dead objects
+            enemies.erase(std::remove_if(enemies.begin(), enemies.end(),
+                [](const Enemy& e){ return !e.alive; }), enemies.end());
+            bullets.erase(std::remove_if(bullets.begin(), bullets.end(),
+                [](const Bullet& b){ return !b.alive; }), bullets.end());
+
+            // Particles
+            particles.erase(std::remove_if(particles.begin(), particles.end(),
+                [&](Particle& p){ return !p.update(dt); }), particles.end());
+
+            // Next wave?
+            if ((int)enemies.size() == 0 &&
+                enemiesToSpawn > 0 &&
+                timeSinceSpawn > spawnInterval * enemiesToSpawn)
+            {
+                startWave(wave + 1);
+                flash.trigger(sf::Color(50, 255, 100, 80));
+            }
+
+            flash.update(dt);
+        }
+
+        // ── Draw ──────────────────────────────────────────────────────────────
+        win.clear(sf::Color(10, 12, 20));
+        drawBackground(win);
+
+        if (state == State::Menu) {
+            win.draw(centeredText("TOP-DOWN SHOOTER", H / 2 - 80.f, 52, sf::Color(50,200,255)));
+            win.draw(centeredText("WASD / ARROWS  to move", H/2,  26));
+            win.draw(centeredText("LEFT CLICK      to shoot", H/2+40, 26));
+            win.draw(centeredText("R               to reload", H/2+80, 26));
+            win.draw(centeredText("Press ENTER to start", H/2+160, 30, sf::Color(255,220,50)));
+        }
+        else if (state == State::Playing || state == State::GameOver) {
+            // Particles (behind player)
+            for (auto& p : particles) win.draw(p.shape);
+
+            // Bullets
+            for (auto& b : bullets) win.draw(b.shape);
+
+            // Enemies
+            for (auto& e : enemies) e.draw(win);
+
+            // Player
+            if (state == State::Playing) player.draw(win);
+
+            // HUD
+            drawHUD(win, player, wave, font);
+            drawCrosshair(win, mousePos);
+            flash.draw(win);
+
+            if (state == State::GameOver) {
+                // Dim overlay
+                sf::RectangleShape dim({(float)W,(float)H});
+                dim.setFillColor(sf::Color(0,0,0,160));
+                win.draw(dim);
+
+                win.draw(centeredText("GAME OVER", H/2 - 60.f, 60, sf::Color(255,80,80)));
+                win.draw(centeredText("Score: " + std::to_string(player.score), H/2+20, 36));
+                win.draw(centeredText("Wave reached: " + std::to_string(wave), H/2+70, 28));
+                win.draw(centeredText("Press ENTER to restart", H/2+140, 28, sf::Color(255,220,50)));
+            }
+        }
+
+        win.display();
+    }
+    return 0;
+}
